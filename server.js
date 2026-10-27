@@ -40,7 +40,13 @@ const PACKS = {
 const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'credits.json');
 const { getBalance, addCredits, spendCredit } = makeLedger(DB_PATH);
 
+// --- family profiles, visitor numbers and documentary jobs live here (Supabase = kept forever; file = wiped on Render restarts) ---
+const { makeStore } = require('./store');
+const store = makeStore({ supabaseUrl: process.env.SUPABASE_URL, supabaseKey: process.env.SUPABASE_SERVICE_KEY, filePath: process.env.DATA_PATH || path.join(path.dirname(DB_PATH), 'data.json') });
+if (store.kind !== 'supabase') console.warn('[WARN] SUPABASE_URL / SUPABASE_SERVICE_KEY are not set — family profiles and visitor numbers are saved in a temporary file that Render wipes on restart.');
+
 const app = express();
+app.use('/api/t', express.text({ type: '*/*', limit: '4kb' }));   // visitor beacons arrive as plain text
 app.use(express.json({ limit: '25mb' }));   // family photos are base64-encoded in the request body
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
@@ -53,7 +59,8 @@ app.use((req, res, next) => {
 // ---------- Gemini request helper: retries rate limits (429) and busy servers (500/503) ----------
 // Works with free Google AI Studio keys too: waits the time Google asks for, backs off, and tells the
 // caller when a model is simply not on the free tier ("limit: 0") or today's quota is used up.
-const GEM_HOST = 'https://generativelanguage.googleapis.com/v1beta/models/';
+const GEM_BASE = (process.env.GEM_BASE || 'https://generativelanguage.googleapis.com').replace(/\/+$/, '');   // only changed for testing
+const GEM_HOST = GEM_BASE + '/v1beta/models/';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 function gemKind(status, j) {
   const e = (j && j.error) || {}; const all = (e.message || '') + ' ' + JSON.stringify(e.details || []);
@@ -93,7 +100,7 @@ const gemErr = res => res.kind === 'not-free' ? 'this model is not on the free t
   : res.kind === 'daily' ? "today's Google quota is used up" : res.kind === 'rate' ? 'Google rate limit — try again in a minute'
   : res.kind === 'busy' ? 'Google servers are busy — try again in a minute' : ((res.j.error && res.j.error.message) || ('HTTP ' + res.status));
 
-app.get('/api/health', (req, res) => res.json({ ok: true, app: 'dynastyvault-server', gemini: !!GEMINI_KEY, portrait: PHOTO_ON, razorpay: !!rzp, voice: !!process.env.DEEPINFRA_KEY, unlock: !!(process.env.UNLOCK_SECRET && process.env.ADMIN_KEY) }));
+app.get('/api/health', (req, res) => res.json({ ok: true, app: 'dynastyvault-server', gemini: !!GEMINI_KEY, portrait: PHOTO_ON, film: PHOTO_ON, profiles: true, storage: store.kind, razorpay: !!rzp, voice: !!process.env.DEEPINFRA_KEY, unlock: !!(process.env.UNLOCK_SECRET && process.env.ADMIN_KEY) }));
 
 app.get('/api/credits/balance', (req, res) => {
   const deviceId = String(req.query.deviceId || '');
@@ -168,6 +175,28 @@ app.post('/api/reunion/generate', async (req, res) => {
   }
 });
 
+// current free-tier text models (Oct 2026) — each has its own quota, so we fall through them
+const TEXT_MODELS = ['gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.5-flash-lite',   // 4 Argon = best quality (paid key); free keys fall through to 3.8 Flash
+                     'gemini-3.6-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash'];
+async function writeText(prompt) {
+  let last = '';
+  for (const model of TEXT_MODELS) {
+    const gc = { temperature: 0.7, maxOutputTokens: 4096 };
+    if (/^gemini-3/.test(model)) gc.thinkingConfig = { thinkingLevel: 'low' };
+    const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: gc };
+    let g = await gemRequest(model, body);
+    if (!g.ok && g.status === 400 && /thinking/i.test((g.j.error && g.j.error.message) || '')) { delete gc.thinkingConfig; g = await gemRequest(model, body); }
+    if (g.ok) {
+      const text = ((((g.j.candidates || [])[0] || {}).content || {}).parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
+      if (text) return { text, model };
+      last = 'empty answer'; continue;
+    }
+    if (!last || g.kind !== 'missing') last = gemErr(g);
+    if (!['missing', 'not-free', 'daily', 'rate', 'busy'].includes(g.kind)) break;
+  }
+  return { text: '', error: last };
+}
+
 // ✨ AI writes a family member's life story from the family's notes. Text is very cheap, so this is
 // free for customers — with a simple per-device daily cap so nobody can run up your Google bill.
 const STORY_DAILY_CAP = Number(process.env.STORY_DAILY_CAP || 30);
@@ -179,24 +208,9 @@ app.post('/api/story/write', async (req, res) => {
   const k = deviceId + '|' + new Date().toISOString().slice(0, 10); const n = (storyUse.get(k) || 0) + 1;
   if (n > STORY_DAILY_CAP) return res.status(429).json({ error: 'Daily story limit reached — try again tomorrow.' });
   storyUse.set(k, n);
-  // current free-tier text models (Oct 2026) — each has its own quota, so we fall through them
-  const models = ['gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.5-flash-lite',   // 4 Argon = best quality (paid key); free keys fall through to 3.8 Flash
-                  'gemini-3.6-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest', 'gemini-2.5-flash'];
-  let last = '';
-  for (const model of models) {
-    const gc = { temperature: 0.7, maxOutputTokens: 4096 };
-    if (/^gemini-3/.test(model)) gc.thinkingConfig = { thinkingLevel: 'low' };
-    const body = { contents: [{ role: 'user', parts: [{ text: String(prompt).slice(0, 6000) }] }], generationConfig: gc };
-    let g = await gemRequest(model, body);
-    if (!g.ok && g.status === 400 && /thinking/i.test((g.j.error && g.j.error.message) || '')) { delete gc.thinkingConfig; g = await gemRequest(model, body); }
-    if (g.ok) {
-      const text = ((((g.j.candidates || [])[0] || {}).content || {}).parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
-      if (text) return res.json({ text, model });
-      last = 'empty answer'; continue;
-    }
-    if (!last || g.kind !== 'missing') last = gemErr(g);
-    if (!['missing', 'not-free', 'daily', 'rate', 'busy'].includes(g.kind)) break;
-  }
+  const out = await writeText(String(prompt).slice(0, 6000));
+  if (out.text) return res.json({ text: out.text, model: out.model });
+  const last = out.error;
   storyUse.set(k, n - 1);   // a failed attempt does not count against the cap
   res.status(502).json({ error: 'Could not write the story: ' + last });
 });
@@ -210,7 +224,7 @@ if (!process.env.DEEPINFRA_KEY) console.warn('[WARN] DEEPINFRA_KEY is not set �
 const voice = makeVoice({ secret:UNLOCK_SECRET || crypto.randomBytes(16).toString('hex'), adminKey:ADMIN_KEY, deepinfraKey:process.env.DEEPINFRA_KEY || '',
   model:process.env.VOICE_MODEL || 'ResembleAI/chatterbox-multilingual', storePath:process.env.ORDERS_PATH || path.join(path.dirname(DB_PATH), 'orders.json') });
 const sendR = (res, r) => r.buf ? res.status(r.status).set({ 'Content-Type':r.type, 'X-Stories-Left':String(r.left), 'Access-Control-Expose-Headers':'X-Stories-Left' }).send(r.buf) : res.status(r.status).json(r.json);
-app.post('/api/admin/approve', (req, res) => sendR(res, voice.approve(req.body || {})));
+app.post('/api/admin/approve', (req, res) => { const b = req.body || {}; const isNew = !voice._db()[String(b.orderId || '').trim().toUpperCase().slice(0, 40)]; const r = voice.approve(b); if (r.status === 200 && isNew && !b.addChars) social.track({ e: 'royal' }); sendR(res, r); });
 app.post('/api/unlock', (req, res) => sendR(res, voice.unlock(req.body || {})));
 app.get('/api/voice/balance', (req, res) => sendR(res, voice.balance(req.query || {})));
 app.post('/api/voice/clone', async (req, res) => sendR(res, await voice.clone(req.body || {})));
@@ -246,5 +260,35 @@ app.post('/api/portrait', async (req, res) => {
     res.status(502).json({ error: 'The portrait could not be made this time. Please try again. (' + lastErr + ')', left });
   } catch (e) { res.status(500).json({ error: 'Server error — please try again.', left }); }
 });
+
+// ---------- 👨‍👩‍👧 family profiles (public / private) + 📊 visitor numbers (see social.js) ----------
+const { makeSocial } = require('./social');
+const social = makeSocial({ store, adminKey: ADMIN_KEY });
+const ipOf = req => String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+const wrap = fn => async (req, res) => { try { sendR(res, await fn(req)); } catch (e) { console.error('[api]', req.path, e.message); res.status(500).json({ error: 'Server error — please try again.' }); } };
+app.get('/api/dyn/check', wrap(req => social.check(req.query)));
+app.post('/api/dyn/save', wrap(req => social.save(req.body || {}, ipOf(req))));
+app.post('/api/dyn/remove', wrap(req => social.remove(req.body || {})));
+app.get('/api/dyn/mine', wrap(req => social.mine(req.query)));
+app.post('/api/dyn/answer', wrap(req => social.answer(req.body || {})));
+app.get('/api/dyn/get', wrap(req => social.get(req.query)));
+app.post('/api/dyn/follow', wrap(req => social.follow(req.body || {}, ipOf(req))));
+app.get('/api/dyn/list', wrap(req => social.list(req.query)));
+app.post('/api/dyn/report', wrap(req => social.report(req.body || {}, ipOf(req))));
+app.post('/api/admin/dyn/hide', wrap(req => social.hide(req.body || {})));
+app.post('/api/t', (req, res) => { try { social.track(typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {})); } catch (e) { /* ignore bad beacons */ } res.status(204).end(); });
+app.get('/api/admin/stats', wrap(req => social.stats(req.query, { keys: { gemini: !!GEMINI_KEY, billing: PHOTO_ON, voice: !!process.env.DEEPINFRA_KEY, unlock: !!(UNLOCK_SECRET && ADMIN_KEY) } })));
+
+// ---------- 🎬 AI family documentary for Royal (see film.js) ----------
+const { makeFilm } = require('./film');
+const film = makeFilm({ store, voice, gemKey: GEMINI_KEY, base: GEM_BASE, photoOn: () => PHOTO_ON, writeText: async p => { const o = await writeText(p); if (!o.text) throw new Error(o.error); return o.text; },
+  filmsPerOrder: Number(process.env.FILMS_PER_ORDER || 1), scenes: Math.max(1, Math.min(5, Number(process.env.FILM_SCENES || 3))),
+  model: process.env.FILM_MODEL || 'gemini-omni-1.1-flash', dailyCap: Number(process.env.FILM_DAILY_CAP || 20) });
+app.get('/api/film/balance', wrap(req => film.balance(req.query)));
+app.post('/api/film/start', wrap(async req => { const r = await film.start(req.body || {}); if (r.status === 200) social.track({ e: 'film' }); return r; }));
+app.get('/api/film/status', wrap(req => film.status(req.query)));
+app.get('/api/film/clip', async (req, res) => { try { const r = await film.clip(req.query); if (r.buf) return res.status(200).set({ 'Content-Type': r.type, 'Cache-Control': 'private, max-age=3600' }).send(r.buf); res.status(r.status).json(r.json); } catch (e) { res.status(500).json({ error: 'Server error.' }); } });
+app.post('/api/admin/films', wrap(req => film.addFilms(req.body || {}, ADMIN_KEY)));
+process.on('SIGTERM', async () => { try { await social.flush(); if (store.flush) store.flush(); } catch (e) { /* ignore */ } process.exit(0); });
 
 app.listen(PORT, () => console.log(`[DynastyVault server] listening on :${PORT}`));
