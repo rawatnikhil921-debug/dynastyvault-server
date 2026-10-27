@@ -15,11 +15,15 @@ const { makeLedger, verifyRazorpaySignature } = require('./ledger');
 
 const PORT = process.env.PORT || 8787;
 const GEMINI_KEY = process.env.GEMINI_KEY || '';
+// Photo models are paid-only on Google. Keep photos switched off until billing is on for the key's project:
+// Render → Environment →  GEMINI_BILLING = on   (stories work on the free key without this)
+const PHOTO_ON = !!GEMINI_KEY && /^(on|yes|true|1)$/i.test(String(process.env.GEMINI_BILLING || '').trim());
 const RZP_KEY_ID = process.env.RAZORPAY_KEY_ID || '';
 const RZP_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || '';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';   // e.g. https://kapoor-family.dynastyvault.app — lock this down once you have a real domain
 
-if (!GEMINI_KEY) console.warn('[WARN] GEMINI_KEY is not set — photo generation will fail until you add it.');
+if (!GEMINI_KEY) console.warn('[WARN] GEMINI_KEY is not set — AI stories and photos are off until you add it.');
+else if (!PHOTO_ON) console.warn('[INFO] GEMINI_KEY set — AI stories ON. Photos stay OFF until you add GEMINI_BILLING=on (after turning on Google billing).');
 if (!RZP_KEY_ID || !RZP_KEY_SECRET) console.warn('[WARN] Razorpay keys are not set — buying credits will fail until you add them.');
 
 const rzp = RZP_KEY_ID && Razorpay ? new Razorpay({ key_id: RZP_KEY_ID, key_secret: RZP_KEY_SECRET }) : null;
@@ -89,7 +93,7 @@ const gemErr = res => res.kind === 'not-free' ? 'this model is not on the free t
   : res.kind === 'daily' ? "today's Google quota is used up" : res.kind === 'rate' ? 'Google rate limit — try again in a minute'
   : res.kind === 'busy' ? 'Google servers are busy — try again in a minute' : ((res.j.error && res.j.error.message) || ('HTTP ' + res.status));
 
-app.get('/api/health', (req, res) => res.json({ ok: true, app: 'dynastyvault-server', gemini: !!GEMINI_KEY, portrait: !!GEMINI_KEY, razorpay: !!rzp, voice: !!process.env.DEEPINFRA_KEY, unlock: !!(process.env.UNLOCK_SECRET && process.env.ADMIN_KEY) }));
+app.get('/api/health', (req, res) => res.json({ ok: true, app: 'dynastyvault-server', gemini: !!GEMINI_KEY, portrait: PHOTO_ON, razorpay: !!rzp, voice: !!process.env.DEEPINFRA_KEY, unlock: !!(process.env.UNLOCK_SECRET && process.env.ADMIN_KEY) }));
 
 app.get('/api/credits/balance', (req, res) => {
   const deviceId = String(req.query.deviceId || '');
@@ -132,7 +136,7 @@ app.post('/api/credits/verify', (req, res) => {
 app.post('/api/reunion/generate', async (req, res) => {
   const { deviceId, prompt, images, aspectRatio, imageSize } = req.body || {};
   if (!deviceId) return res.status(400).json({ error: 'deviceId required' });
-  if (!GEMINI_KEY) return res.status(500).json({ error: 'The server is not set up with a Gemini key yet.' });
+  if (!PHOTO_ON) return res.status(503).json({ error: 'AI photos are being set up.', code: 'NOT_READY' });
   if (!Array.isArray(images) || !images.length) return res.status(400).json({ error: 'No photos were sent.' });
   const left = spendCredit(deviceId);
   if (left == null) return res.status(402).json({ error: 'No credits left.', code: 'NO_CREDITS' });
@@ -217,7 +221,7 @@ app.post('/api/portrait', async (req, res) => {
   const b = req.body || {};
   const o = voice.check(b.orderId, b.code);
   if (!o || !['royal', 'gift'].includes(o.item)) return res.status(401).json({ error: 'Reunion portraits come with Royal. Enter your Royal unlock code in Plans.', code: 'NOT_UNLOCKED' });
-  if (!GEMINI_KEY) return res.status(503).json({ error: 'Portraits are being set up.', code: 'NOT_READY' });
+  if (!PHOTO_ON) return res.status(503).json({ error: 'Portraits are being set up.', code: 'NOT_READY' });
   const used = o.portraits || 0; const left = Math.max(0, PORTRAITS_PER_ORDER - used);
   if (!left) return res.status(402).json({ error: 'All portraits in this plan are used.', code: 'NO_PORTRAITS', left: 0 });
   const images = Array.isArray(b.images) ? b.images.slice(0, 14) : [];
