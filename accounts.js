@@ -1,0 +1,229 @@
+/* =========================================================
+   DYNASTYVAULT — PERSONAL ACCOUNTS (like Instagram / Facebook)
+   • Everyone makes their own account: @username + name + password (email optional, for recovery).
+   • Profile: photo, bio, city, public or private, and their family tree from the app.
+   • Follow people: public = instant, private = request that the owner approves.
+   • Feed: posts and memories from the people you follow.
+   • Log in on any phone: the family tree is backed up to the account.
+   Passwords are stored only as scrypt hashes. Nabu can reset a forgotten password from admin.html.
+   ========================================================= */
+const crypto = require('crypto');
+
+const S = (x, n) => String(x == null ? '' : x).slice(0, n);
+const N = x => Math.max(0, Math.min(1e9, Math.round(+x || 0)));
+const H = s => crypto.createHash('sha256').update(String(s)).digest('hex');
+const RESERVED = new Set(['admin', 'api', 'dynastyvault', 'support', 'help', 'explore', 'login', 'signup', 'settings', 'official', 'team', 'royal', 'about', 'privacy', 'terms', 'nabu', 'root', 'null', 'undefined']);
+const IMG = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
+
+function scryptHash(pw, salt) { return new Promise((res, rej) => crypto.scrypt(String(pw), salt, 32, { N: 16384, r: 8, p: 1 }, (e, k) => e ? rej(e) : res(k.toString('hex')))); }
+
+function makeAccounts({ store, adminKey }) {
+  const okUser = u => /^[a-z0-9](?:[a-z0-9._]{1,22})[a-z0-9]$/.test(u) && !/[._]{2}/.test(u) && !RESERVED.has(u);
+  const normU = u => S(u, 40).trim().toLowerCase().replace(/^@+/, '');
+  const normE = e => S(e, 120).trim().toLowerCase();
+  const okEmail = e => !e || /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e);
+
+  // ---------- rate limits ----------
+  const hits = new Map();
+  function limited(k, max, ms) {
+    const now = Date.now(); const a = (hits.get(k) || []).filter(t => now - t < ms); a.push(now); hits.set(k, a);
+    if (hits.size > 8000) for (const [x, v] of hits) if (!v.length || now - v[v.length - 1] > ms) hits.delete(x);
+    return a.length > max;
+  }
+  const tooMany = { status: 429, json: { error: 'Too many tries — wait a few minutes and try again.', code: 'RATE' } };
+
+  // ---------- records ----------
+  const getA = id => id ? store.get('u:' + id) : null;
+  const cardOf = a => ({ id: a.id, un: a.un, name: a.name, ph: a.thumb || '', city: a.city || '', bio: S(a.bio, 80), vis: a.vis, m: a.m || 0, g: a.g || 0, fam: !!a.famOn && !!a.hasFam, fol: (a.fol || []).length, at: a.up || a.at, hidden: !!a.hidden });
+  async function putA(a) { a.up = Date.now(); await store.set('u:' + a.id, a); await store.set('c2:' + a.id, cardOf(a)); cards = null; }
+  let cards = null, cardsAt = 0;
+  async function allCards() { if (cards && Date.now() - cardsAt < 45000) return cards; cards = (await store.list('c2:', 2000)).map(r => r.v).filter(c => c && !c.hidden); cardsAt = Date.now(); return cards; }
+
+  const meOut = (a, extra) => Object.assign({ id: a.id, un: a.un, name: a.name, ph: a.ph || '', bio: a.bio || '', city: a.city || '', email: a.em || '', vis: a.vis, famOn: !!a.famOn, hasFam: !!a.hasFam,
+    followers: (a.fol || []).length, following: (a.fing || []).length, views: a.views || 0, at: a.at,
+    requests: (a.req || []).map(r => r.id), notes: (a.notes || []).slice(0, 40) }, extra || {});
+
+  // ---------- sessions ----------
+  const sessCache = new Map();
+  async function newSession(id) { const tok = 'dvs_' + crypto.randomBytes(24).toString('base64url'); await store.set('t:' + H(tok), { id, at: Date.now() }); return tok; }
+  async function auth(req) {
+    const h = String((req.headers && req.headers.authorization) || '').replace(/^Bearer\s+/i, '').trim() || S((req.body || {}).token, 80) || S((req.query || {}).token, 80);
+    if (!h || h.length < 20) return null;
+    const k = H(h); const c = sessCache.get(k); if (c && Date.now() - c.t < 60000) return c.a ? getA(c.a) : null;
+    const s = await store.get('t:' + k); sessCache.set(k, { a: s && s.id, t: Date.now() }); if (sessCache.size > 5000) sessCache.clear();
+    if (!s) return null; const a = await getA(s.id); return a && !a.disabled ? a : null;
+  }
+  const NEED = { status: 401, json: { error: 'Please log in again.', code: 'LOGIN' } };
+
+  // ---------- notes (notifications) ----------
+  function note(a, type, from) { a.notes = a.notes || []; a.notes = a.notes.filter(n => !(n.type === type && n.id === from)); a.notes.unshift({ type, id: from, t: Date.now() }); a.notes = a.notes.slice(0, 60); }
+  async function expandIds(ids) { const out = []; for (const id of ids.slice(0, 200)) { const c = await store.get('c2:' + id); if (c) out.push(c); } return out; }
+
+  // ---------- sign up / log in ----------
+  async function check(q) { const u = normU(q.u); if (!okUser(u)) return { status: 200, json: { ok: true, free: false, why: 'format' } }; return { status: 200, json: { ok: true, free: !(await store.get('n:' + u)) } }; }
+  async function signup(b, ip) {
+    if (limited('su' + ip, 8, 3600000)) return tooMany;
+    const un = normU(b.username); const name = S(b.name, 60).trim(); const pw = String(b.password || ''); const em = normE(b.email);
+    if (!okUser(un)) return { status: 400, json: { error: 'Username: 3–24 small letters or numbers (dots and underscores allowed).', code: 'BAD_USER' } };
+    if (name.length < 2) return { status: 400, json: { error: 'Please write your name.', code: 'BAD_NAME' } };
+    if (pw.length < 6) return { status: 400, json: { error: 'Password must be at least 6 characters.', code: 'BAD_PASS' } };
+    if (!okEmail(em)) return { status: 400, json: { error: 'That email does not look right.', code: 'BAD_EMAIL' } };
+    if (await store.get('n:' + un)) return { status: 409, json: { error: 'That username is taken.', code: 'TAKEN' } };
+    if (em && await store.get('e:' + em)) return { status: 409, json: { error: 'An account with this email already exists — log in instead.', code: 'EMAIL_TAKEN' } };
+    const id = crypto.randomBytes(9).toString('base64url'); const salt = crypto.randomBytes(16).toString('hex');
+    const a = { id, un, name, em, pw: { s: salt, h: await scryptHash(pw, salt) }, ph: '', thumb: '', bio: S(b.bio, 300), city: S(b.city, 60), vis: b.vis === 'private' ? 'private' : 'public', famOn: b.famOn !== false,
+      at: Date.now(), fol: [], fing: [], req: [], notes: [], views: 0 };
+    await store.set('n:' + un, id); if (em) await store.set('e:' + em, id); await putA(a);
+    return { status: 200, json: { ok: true, token: await newSession(id), me: meOut(a) } };
+  }
+  async function login(b, ip) {
+    const who = S(b.username, 120).trim().toLowerCase().replace(/^@+/, '');
+    if (limited('li' + ip, 20, 900000) || limited('lu' + who, 10, 900000)) return tooMany;
+    const id = who.includes('@') ? await store.get('e:' + who) : await store.get('n:' + who);
+    const a = id && await getA(id);
+    const bad = { status: 401, json: { error: 'Wrong username or password.', code: 'BAD_LOGIN' } };
+    if (!a || !a.pw) { await scryptHash('x', 'y'); return bad; }   // same delay either way
+    if (await scryptHash(String(b.password || ''), a.pw.s) !== a.pw.h) return bad;
+    if (a.disabled) return { status: 403, json: { error: 'This account is switched off. Message support on WhatsApp.' } };
+    return { status: 200, json: { ok: true, token: await newSession(a.id), me: meOut(a) } };
+  }
+  async function logout(req) { const h = String((req.headers.authorization || '')).replace(/^Bearer\s+/i, '').trim(); if (h) { await store.del('t:' + H(h)); sessCache.delete(H(h)); } return { status: 200, json: { ok: true } }; }
+  async function me(req) { const a = await auth(req); if (!a) return NEED; const reqs = await expandIds((a.req || []).map(r => r.id)); const nids = [...new Set((a.notes || []).slice(0, 20).map(n => n.id))]; const nc = await expandIds(nids); return { status: 200, json: { ok: true, me: meOut(a, { requestCards: reqs, noteCards: nc }) } }; }
+
+  async function update(req) {
+    const a = await auth(req); if (!a) return NEED; const b = req.body || {};
+    if (b.username != null && normU(b.username) !== a.un) {
+      const un = normU(b.username); if (!okUser(un)) return { status: 400, json: { error: 'Username: 3–24 small letters or numbers.', code: 'BAD_USER' } };
+      if (await store.get('n:' + un)) return { status: 409, json: { error: 'That username is taken.', code: 'TAKEN' } };
+      await store.del('n:' + a.un); await store.set('n:' + un, a.id); a.un = un;
+    }
+    if (b.name != null) { const n = S(b.name, 60).trim(); if (n.length >= 2) a.name = n; }
+    if (b.bio != null) a.bio = S(b.bio, 300);
+    if (b.city != null) a.city = S(b.city, 60);
+    if (b.vis != null) a.vis = b.vis === 'private' ? 'private' : 'public';
+    if (b.famOn != null) a.famOn = !!b.famOn;
+    if (b.email != null) { const em = normE(b.email); if (!okEmail(em)) return { status: 400, json: { error: 'That email does not look right.' } }; if (em !== (a.em || '')) { if (em && await store.get('e:' + em)) return { status: 409, json: { error: 'That email is used by another account.' } }; if (a.em) await store.del('e:' + a.em); if (em) await store.set('e:' + em, a.id); a.em = em; } }
+    if (b.photo != null) { const p = String(b.photo); if (!p) { a.ph = ''; a.thumb = ''; } else if (IMG.test(p) && p.length < 260000) { a.ph = p; a.thumb = IMG.test(String(b.thumb || '')) && String(b.thumb).length < 30000 ? b.thumb : ''; } else return { status: 400, json: { error: 'Photo is too big.' } }; }
+    if (a.vis === 'public' && (a.req || []).length) { a.fol = a.fol || []; for (const r of a.req) { if (!a.fol.includes(r.id)) { a.fol.push(r.id); const o = await getA(r.id); if (o) { o.fing = o.fing || []; if (!o.fing.includes(a.id)) o.fing.push(a.id); note(o, 'accepted', a.id); await putA(o); } } } a.req = []; }
+    await putA(a); return { status: 200, json: { ok: true, me: meOut(a) } };
+  }
+  async function password(req) {
+    const a = await auth(req); if (!a) return NEED; const b = req.body || {};
+    if (await scryptHash(String(b.old || ''), a.pw.s) !== a.pw.h) return { status: 401, json: { error: 'Your current password is wrong.' } };
+    if (String(b.new || '').length < 6) return { status: 400, json: { error: 'New password must be at least 6 characters.' } };
+    a.pw = { s: crypto.randomBytes(16).toString('hex') }; a.pw.h = await scryptHash(String(b.new), a.pw.s); await putA(a);
+    return { status: 200, json: { ok: true } };
+  }
+  async function removeAcct(req) {
+    const a = await auth(req); if (!a) return NEED; const b = req.body || {};
+    if (await scryptHash(String(b.password || ''), a.pw.s) !== a.pw.h) return { status: 401, json: { error: 'Password is wrong.' } };
+    for (const id of a.fing || []) { const o = await getA(id); if (o) { o.fol = (o.fol || []).filter(x => x !== a.id); o.req = (o.req || []).filter(r => r.id !== a.id); await putA(o); } }
+    for (const id of a.fol || []) { const o = await getA(id); if (o) { o.fing = (o.fing || []).filter(x => x !== a.id); await putA(o); } }
+    await store.del('n:' + a.un); if (a.em) await store.del('e:' + a.em); await store.del('f:' + a.id); await store.del('b:' + a.id); await store.del('c2:' + a.id); await store.del('u:' + a.id); cards = null;
+    return { status: 200, json: { ok: true } };
+  }
+
+  // ---------- family tree on the profile + backup for other phones ----------
+  const postCache = new Map();
+  async function family(req) {
+    const a = await auth(req); if (!a) return NEED; const b = req.body || {};
+    if (b.off) { a.hasFam = false; await store.del('f:' + a.id); postCache.delete(a.id); await putA(a); return { status: 200, json: { ok: true } }; }
+    const raw = JSON.stringify(b.d || {}); if (raw.length > 1600000) return { status: 413, json: { error: 'Family is too big — untick member photos.', code: 'TOO_BIG' } };
+    const st = (b.d && b.d.st) || {}; a.m = N(st.m); a.g = N(st.g); a.hasFam = true; a.famName = S(b.d && b.d.n, 60);
+    await store.set('f:' + a.id, { d: b.d, at: Date.now() }); postCache.set(a.id, postsOf(b.d)); await putA(a);
+    return { status: 200, json: { ok: true } };
+  }
+  async function backupPut(req) {
+    const a = await auth(req); if (!a) return NEED; const raw = JSON.stringify((req.body || {}).vault || null);
+    if (raw.length > 4500000) return { status: 413, json: { error: 'Backup is too big.', code: 'TOO_BIG' } };
+    await store.set('b:' + a.id, { v: (req.body || {}).vault, at: Date.now() }); return { status: 200, json: { ok: true } };
+  }
+  async function backupGet(req) { const a = await auth(req); if (!a) return NEED; const b = await store.get('b:' + a.id); return { status: 200, json: { ok: true, vault: b ? b.v : null, at: b ? b.at : 0 } }; }
+
+  // ---------- look at someone ----------
+  const seen = new Map();
+  async function view(req) {
+    const q = req.query || {}; const id = await store.get('n:' + normU(q.u)); const a = id && await getA(id);
+    if (!a || a.hidden || a.disabled) return { status: 404, json: { error: 'This account does not exist any more.', code: 'NONE' } };
+    const v = await auth(req); const self = !!v && v.id === a.id;
+    const following = !!v && (a.fol || []).includes(v.id); const requested = !!v && (a.req || []).some(r => r.id === v.id);
+    const open = self || a.vis === 'public' || following;
+    const vk = (v ? v.id : 'd' + S(q.d, 40)) + '|' + a.id + '|' + new Date().toISOString().slice(0, 10);
+    if (!self && !seen.has(vk)) { seen.set(vk, 1); if (seen.size > 30000) seen.clear(); a.views = (a.views || 0) + 1; await store.set('u:' + a.id, a); }
+    const out = { ok: true, p: Object.assign(cardOf(a), { ph: a.ph || a.thumb || '', bio: a.bio || '', following: (a.fing || []).length, followers: (a.fol || []).length, views: a.views || 0, famName: a.famName || '' }),
+      self, isFollowing: following, requested, followsYou: !!v && (a.fing || []).includes(v.id), open };
+    if (open && a.famOn && a.hasFam) { const f = await store.get('f:' + a.id); if (f) out.d = f.d; }
+    return { status: 200, json: out };
+  }
+  async function follow(req, ip) {
+    const v = await auth(req); if (!v) return NEED; if (limited('fo' + v.id, 150, 600000)) return tooMany;
+    const b = req.body || {}; const id = await store.get('n:' + normU(b.u)); const a = id && await getA(id);
+    if (!a || a.hidden) return { status: 404, json: { error: 'Account not found.' } }; if (a.id === v.id) return { status: 400, json: { error: 'That is you.' } };
+    a.fol = a.fol || []; a.req = a.req || []; v.fing = v.fing || [];
+    if (b.on === false) { a.fol = a.fol.filter(x => x !== v.id); a.req = a.req.filter(r => r.id !== v.id); v.fing = v.fing.filter(x => x !== a.id); }
+    else if (a.vis === 'public') { if (!a.fol.includes(v.id)) { a.fol.push(v.id); note(a, 'follow', v.id); } if (!v.fing.includes(a.id)) v.fing.push(a.id); }
+    else if (!a.fol.includes(v.id) && !a.req.some(r => r.id === v.id)) { a.req.unshift({ id: v.id, t: Date.now() }); a.req = a.req.slice(0, 500); note(a, 'request', v.id); }
+    await putA(a); await putA(v);
+    return { status: 200, json: { ok: true, isFollowing: a.fol.includes(v.id), requested: a.req.some(r => r.id === v.id), followers: a.fol.length } };
+  }
+  async function answer(req) {
+    const a = await auth(req); if (!a) return NEED; const b = req.body || {}; const rid = S(b.id, 20);
+    const had = (a.req || []).some(r => r.id === rid); a.req = (a.req || []).filter(r => r.id !== rid);
+    if (b.removeFollower) { a.fol = (a.fol || []).filter(x => x !== rid); const o = await getA(rid); if (o) { o.fing = (o.fing || []).filter(x => x !== a.id); await putA(o); } }
+    if (had && b.ok) { a.fol = a.fol || []; if (!a.fol.includes(rid)) a.fol.push(rid); const o = await getA(rid); if (o) { o.fing = o.fing || []; if (!o.fing.includes(a.id)) o.fing.push(a.id); note(o, 'accepted', a.id); await putA(o); } }
+    await putA(a); return { status: 200, json: { ok: true, followers: a.fol.length, requests: a.req.length } };
+  }
+  async function people(req) {
+    const q = req.query || {}; const id = await store.get('n:' + normU(q.u)); const a = id && await getA(id); if (!a || a.hidden) return { status: 404, json: { error: 'Not found.' } };
+    const v = await auth(req); const open = (v && v.id === a.id) || a.vis === 'public' || (v && (a.fol || []).includes(v.id));
+    if (!open) return { status: 403, json: { error: 'This account is private.', code: 'PRIVATE' } };
+    const ids = q.kind === 'following' ? (a.fing || []) : (a.fol || []);
+    return { status: 200, json: { ok: true, items: (await expandIds(ids.slice().reverse())).filter(c => !c.hidden) } };
+  }
+  async function search(req) {
+    const q = req.query || {}; const term = S(q.q, 60).trim().toLowerCase().replace(/^@/, ''); const v = await auth(req);
+    let c = await allCards(); if (v) c = c.filter(x => x.id !== v.id);
+    if (term) c = c.filter(x => (x.un + ' ' + x.name + ' ' + x.city + ' ' + x.bio).toLowerCase().includes(term));
+    c = c.slice().sort((x, y) => (y.vis === 'public') - (x.vis === 'public') || (y.fol + y.m / 5 + (y.ph ? 2 : 0)) - (x.fol + x.m / 5 + (x.ph ? 2 : 0)) || y.at - x.at);
+    const fing = new Set(v ? v.fing || [] : []);
+    return { status: 200, json: { ok: true, total: c.length, items: c.slice(0, Math.min(60, N(q.limit) || 40)).map(x => Object.assign({}, x, { isFollowing: fing.has(x.id) })) } };
+  }
+  function postsOf(d) {
+    const KIND = { p: 'post', m: 'memory', v: 'voice' };
+    return (Array.isArray(d && d.p) ? d.p : []).slice(0, 15).map(r => ({ k: KIND[r[0]] || 'post', by: S(r[1], 60), text: S(r[2], 400), at: +r[3] || 0, about: S(r[4], 80) })).filter(p => p.text);
+  }
+  async function feed(req) {
+    const v = await auth(req); if (!v) return NEED; const out = [];
+    for (const id of (v.fing || []).slice(-150)) {
+      const a = await getA(id); if (!a || a.hidden || !a.famOn) continue;
+      let posts = postCache.get(id); if (!posts) { const f = await store.get('f:' + id); posts = f ? postsOf(f.d) : []; postCache.set(id, posts); }
+      const who = { un: a.un, name: a.name, ph: a.thumb || '', fam: a.famName || '' };
+      posts.forEach(p => out.push(Object.assign({}, p, { who })));
+      if (a.at > Date.now() - 14 * 86400000) out.push({ k: 'joined', at: a.at, text: '', who });
+    }
+    out.sort((x, y) => y.at - x.at);
+    return { status: 200, json: { ok: true, items: out.slice(0, 80) } };
+  }
+  async function report(req, ip) { if (limited('rp' + ip, 10, 3600000)) return tooMany; const b = req.body || {}; const t = Date.now(); await store.set('r:' + t + ':' + normU(b.u), { h: normU(b.u), why: S(b.why, 300), t, acct: true }); return { status: 200, json: { ok: true } }; }
+
+  // ---------- admin ----------
+  async function adminHide(b) {
+    if (!adminKey || b.key !== adminKey) return { status: 401, json: { error: 'Wrong admin key.' } };
+    const id = await store.get('n:' + normU(b.u)); const a = id && await getA(id); if (!a) return { status: 404, json: { error: 'Not found.' } };
+    a.hidden = b.hide !== false; await putA(a); return { status: 200, json: { ok: true, hidden: a.hidden } };
+  }
+  async function adminReset(b) {
+    if (!adminKey || b.key !== adminKey) return { status: 401, json: { error: 'Wrong admin key.' } };
+    const id = await store.get('n:' + normU(b.u)); const a = id && await getA(id); if (!a) return { status: 404, json: { error: 'Not found.' } };
+    const temp = 'dv' + crypto.randomBytes(4).toString('hex'); a.pw = { s: crypto.randomBytes(16).toString('hex') }; a.pw.h = await scryptHash(temp, a.pw.s); await putA(a);
+    return { status: 200, json: { ok: true, username: a.un, temp } };
+  }
+  async function adminStats() {
+    const all = (await store.list('c2:', 2000)).map(r => r.v).filter(Boolean);
+    return { total: all.length, public: all.filter(c => c.vis === 'public' && !c.hidden).length, private: all.filter(c => c.vis !== 'public' && !c.hidden).length, hidden: all.filter(c => c.hidden).length,
+      withFamily: all.filter(c => c.fam).length, recent: all.slice(0, 15).map(c => ({ un: c.un, name: c.name, vis: c.vis, m: c.m, fol: c.fol, hidden: c.hidden, at: c.at })) };
+  }
+
+  return { check, signup, login, logout, me, update, password, removeAcct, family, backupPut, backupGet, view, follow, answer, people, search, feed, report, adminHide, adminReset, adminStats };
+}
+module.exports = { makeAccounts };

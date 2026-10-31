@@ -50,7 +50,7 @@ app.use('/api/t', express.text({ type: '*/*', limit: '4kb' }));   // visitor bea
 app.use(express.json({ limit: '25mb' }));   // family photos are base64-encoded in the request body
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -100,7 +100,7 @@ const gemErr = res => res.kind === 'not-free' ? 'this model is not on the free t
   : res.kind === 'daily' ? "today's Google quota is used up" : res.kind === 'rate' ? 'Google rate limit — try again in a minute'
   : res.kind === 'busy' ? 'Google servers are busy — try again in a minute' : ((res.j.error && res.j.error.message) || ('HTTP ' + res.status));
 
-app.get('/api/health', (req, res) => res.json({ ok: true, app: 'dynastyvault-server', gemini: !!GEMINI_KEY, portrait: PHOTO_ON, film: PHOTO_ON, profiles: true, storage: store.kind, razorpay: !!rzp, voice: !!process.env.DEEPINFRA_KEY, unlock: !!(process.env.UNLOCK_SECRET && process.env.ADMIN_KEY) }));
+app.get('/api/health', (req, res) => res.json({ ok: true, app: 'dynastyvault-server', gemini: !!GEMINI_KEY, portrait: PHOTO_ON, film: PHOTO_ON, profiles: true, accounts: true, storage: store.kind, razorpay: !!rzp, voice: !!process.env.DEEPINFRA_KEY, unlock: !!(process.env.UNLOCK_SECRET && process.env.ADMIN_KEY) }));
 
 app.get('/api/credits/balance', (req, res) => {
   const deviceId = String(req.query.deviceId || '');
@@ -277,7 +277,30 @@ app.get('/api/dyn/list', wrap(req => social.list(req.query)));
 app.post('/api/dyn/report', wrap(req => social.report(req.body || {}, ipOf(req))));
 app.post('/api/admin/dyn/hide', wrap(req => social.hide(req.body || {})));
 app.post('/api/t', (req, res) => { try { social.track(typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {})); } catch (e) { /* ignore bad beacons */ } res.status(204).end(); });
-app.get('/api/admin/stats', wrap(req => social.stats(req.query, { keys: { gemini: !!GEMINI_KEY, billing: PHOTO_ON, voice: !!process.env.DEEPINFRA_KEY, unlock: !!(UNLOCK_SECRET && ADMIN_KEY) } })));
+// ---------- 👤 personal accounts — like Instagram / Facebook (see accounts.js) ----------
+const { makeAccounts } = require('./accounts');
+const acc = makeAccounts({ store, adminKey: ADMIN_KEY });
+app.get('/api/acct/check', wrap(req => acc.check(req.query)));
+app.post('/api/acct/signup', wrap(async req => { const r = await acc.signup(req.body || {}, ipOf(req)); if (r.status === 200) social.track({ e: 'signup' }); return r; }));
+app.post('/api/acct/login', wrap(req => acc.login(req.body || {}, ipOf(req))));
+app.post('/api/acct/logout', wrap(req => acc.logout(req)));
+app.get('/api/acct/me', wrap(req => acc.me(req)));
+app.post('/api/acct/update', wrap(req => acc.update(req)));
+app.post('/api/acct/password', wrap(req => acc.password(req)));
+app.post('/api/acct/delete', wrap(req => acc.removeAcct(req)));
+app.post('/api/acct/family', wrap(req => acc.family(req)));
+app.post('/api/acct/backup', wrap(req => acc.backupPut(req)));
+app.get('/api/acct/backup', wrap(req => acc.backupGet(req)));
+app.get('/api/people/view', wrap(req => acc.view(req)));
+app.post('/api/people/follow', wrap(async req => { const r = await acc.follow(req, ipOf(req)); if (r.status === 200 && (req.body || {}).on !== false) social.track({ e: 'follow' }); return r; }));
+app.post('/api/people/answer', wrap(req => acc.answer(req)));
+app.get('/api/people/list', wrap(req => acc.people(req)));
+app.get('/api/people/search', wrap(req => acc.search(req)));
+app.get('/api/people/feed', wrap(req => acc.feed(req)));
+app.post('/api/people/report', wrap(req => acc.report(req, ipOf(req))));
+app.post('/api/admin/acct/hide', wrap(req => acc.adminHide(req.body || {})));
+app.post('/api/admin/acct/reset', wrap(req => acc.adminReset(req.body || {})));
+app.get('/api/admin/stats', wrap(async req => social.stats(req.query, { accounts: req.query.key === ADMIN_KEY && ADMIN_KEY ? await acc.adminStats() : null, keys: { gemini: !!GEMINI_KEY, billing: PHOTO_ON, voice: !!process.env.DEEPINFRA_KEY, unlock: !!(UNLOCK_SECRET && ADMIN_KEY) } })));
 
 // ---------- 🎬 AI family documentary for Royal (see film.js) ----------
 const { makeFilm } = require('./film');

@@ -137,7 +137,7 @@ function makeSocial({ store, adminKey }) {
   }
 
   // ---------- visitor numbers ----------
-  const EVENTS = ['visit', 'app', 'tree', 'pub', 'follow', 'film', 'royal', 'share', 'story', 'pay'];
+  const EVENTS = ['visit', 'app', 'tree', 'pub', 'follow', 'film', 'royal', 'share', 'story', 'pay', 'signup'];
   const live = new Map();          // viewer → last seen (for "online now")
   let buf = {};                    // day → pending counts
   function track(b) {
@@ -173,7 +173,7 @@ function makeSocial({ store, adminKey }) {
     for (let i = nd - 1; i >= 0; i--) {
       const d = day(Date.now() - i * 86400000); const s = (await store.get('s:' + d)) || { ev: {}, u: {} };
       const u = Object.keys(s.u || {}); u.forEach(x => allU.add(x));
-      days.push({ d, users: u.length, visit: s.ev.visit || 0, app: s.ev.app || 0, tree: s.ev.tree || 0, pub: s.ev.pub || 0, film: s.ev.film || 0, royal: s.ev.royal || 0, share: s.ev.share || 0, pay: s.ev.pay || 0 });
+      days.push({ d, users: u.length, signup: s.ev.signup || 0, visit: s.ev.visit || 0, app: s.ev.app || 0, tree: s.ev.tree || 0, pub: s.ev.pub || 0, film: s.ev.film || 0, royal: s.ev.royal || 0, share: s.ev.share || 0, pay: s.ev.pay || 0 });
       add(tot.ev, s.ev); add(tot.pg, s.pg); add(tot.lg, s.lg); add(tot.rf, s.rf);
     }
     const now = Date.now(); let online = 0; for (const [k, t] of live) { if (now - t < 300000) online++; else if (now - t > 3600000) live.delete(k); }
