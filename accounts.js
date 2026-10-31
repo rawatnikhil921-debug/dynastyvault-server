@@ -240,6 +240,22 @@ function makeAccounts({ store, adminKey }) {
     for (const [, x, why, mu] of out.slice(0, Math.min(30, N(q.limit) || 15))) items.push(Object.assign({}, x, { why, mutual: mu.length, mutualNames: mu.length ? await nameOf(mu) : [], followsYou: fol.has(x.id), isFollowing: false }));
     return { status: 200, json: { ok: true, items } };
   }
+  // Explore: recent posts from public families, newest first, a few per family so one family can't fill the page
+  let exCache = null, exAt = 0;
+  async function explore(req) {
+    const q = req.query || {}; const v = await auth(req);
+    if (!exCache || Date.now() - exAt > 60000) {
+      const c = (await allCards()).filter(x => x.vis === 'public' && x.fam).sort((a, b) => (b.fol || 0) - (a.fol || 0) || b.at - a.at).slice(0, 60);
+      const out = [];
+      for (const x of c) {
+        let posts = postCache.get(x.id); if (!posts) { const f = await store.get('f:' + x.id); posts = f ? postsOf(f.d) : []; postCache.set(x.id, posts); }
+        posts.slice(0, 4).forEach(p => out.push(Object.assign({}, p, { who: { un: x.un, name: x.name, ph: x.ph || '' } })));
+      }
+      out.sort((a, b) => b.at - a.at); exCache = out; exAt = Date.now();
+    }
+    const me = v ? v.un : ''; const items = exCache.filter(p => p.who.un !== me).slice(0, Math.min(90, N(q.limit) || 60));
+    return { status: 200, json: { ok: true, items } };
+  }
   async function following(req) {   // people I follow, newest first — for the story-ring row
     const v = await auth(req); if (!v) return NEED;
     return { status: 200, json: { ok: true, items: (await expandIds((v.fing || []).slice(-30).reverse())).filter(c => !c.hidden) } };
@@ -281,6 +297,6 @@ function makeAccounts({ store, adminKey }) {
       withFamily: all.filter(c => c.fam).length, recent: all.slice(0, 15).map(c => ({ un: c.un, name: c.name, vis: c.vis, m: c.m, fol: c.fol, hidden: c.hidden, at: c.at })) };
   }
 
-  return { check, signup, login, logout, me, update, password, removeAcct, family, backupPut, backupGet, view, follow, answer, people, search, suggest, following, feed, report, adminHide, adminReset, adminStats };
+  return { check, signup, login, logout, me, update, password, removeAcct, family, backupPut, backupGet, view, follow, answer, people, search, suggest, following, explore, feed, report, adminHide, adminReset, adminStats };
 }
 module.exports = { makeAccounts };
