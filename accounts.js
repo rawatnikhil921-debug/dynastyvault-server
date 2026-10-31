@@ -130,7 +130,7 @@ function makeAccounts({ store, adminKey }) {
     if (b.off) { a.hasFam = false; await store.del('f:' + a.id); postCache.delete(a.id); await putA(a); return { status: 200, json: { ok: true } }; }
     const raw = JSON.stringify(b.d || {}); if (raw.length > 1600000) return { status: 413, json: { error: 'Family is too big — untick member photos.', code: 'TOO_BIG' } };
     const st = (b.d && b.d.st) || {}; a.m = N(st.m); a.g = N(st.g); a.hasFam = true; a.famName = S(b.d && b.d.n, 60);
-    await store.set('f:' + a.id, { d: b.d, at: Date.now() }); postCache.set(a.id, postsOf(b.d)); await putA(a);
+    await store.set('f:' + a.id, { d: b.d, at: Date.now() }); postCache.set(a.id, postsOf(b.d)); await putA(a); kinIdx = null; exCache = null;
     return { status: 200, json: { ok: true } };
   }
   async function backupPut(req) {
@@ -256,6 +256,41 @@ function makeAccounts({ store, adminKey }) {
     const me = v ? v.un : ''; const items = exCache.filter(p => p.who.un !== me).slice(0, Math.min(90, N(q.limit) || 60));
     return { status: 200, json: { ok: true, items } };
   }
+  // 🧬 Kin Finder: which public family trees contain the same ancestors as mine?
+  const normName = n => fold(n).replace(/[^a-z\u0900-\u097f\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  let kinIdx = null, kinAt = 0;
+  async function kinIndex() {
+    if (kinIdx && Date.now() - kinAt < 300000) return kinIdx;
+    const idx = new Map();
+    const c = (await allCards()).filter(x => x.vis === 'public' && x.fam).slice(0, 1500);
+    for (const x of c) {
+      const f = await store.get('f:' + x.id); const rows = f && f.d && f.d.ts && Array.isArray(f.d.ts.p) ? f.d.ts.p : [];
+      for (const r of rows.slice(0, 400)) {
+        const nm = normName(r && r[0]); if (nm.split(' ').length < 2) continue;
+        const y = (/^(\d{4})/.exec(String((r && r[3]) || '')) || [])[1] || '';
+        if (!idx.has(nm)) idx.set(nm, []); idx.get(nm).push({ id: x.id, un: x.un, name: x.name, ph: x.ph || '', person: S(r[0], 80), y, pos: S(r[1], 60) });
+      }
+    }
+    kinIdx = idx; kinAt = Date.now(); return idx;
+  }
+  async function kin(req, ip) {
+    if (limited('kn' + ip, 60, 600000)) return tooMany;
+    const v = await auth(req); const b = req.body || {};
+    const names = (Array.isArray(b.names) ? b.names : []).slice(0, 300);
+    const idx = await kinIndex(); const by = new Map();
+    for (const it of names) {
+      const nm = normName(Array.isArray(it) ? it[0] : it); if (nm.split(' ').length < 2) continue;
+      const y = String((Array.isArray(it) ? it[1] : '') || '').slice(0, 4);
+      for (const h of idx.get(nm) || []) {
+        if (v && h.id === v.id) continue;
+        if (y && h.y && Math.abs(+y - +h.y) > 2) continue;
+        if (!by.has(h.id)) by.set(h.id, { un: h.un, name: h.name, ph: h.ph, people: [] });
+        const g = by.get(h.id); if (!g.people.some(p => p.person === h.person)) g.people.push({ person: h.person, y: h.y, pos: h.pos, sure: !!(y && h.y) });
+      }
+    }
+    const items = [...by.values()].sort((a, b) => b.people.length - a.people.length || b.people.filter(p => p.sure).length - a.people.filter(p => p.sure).length).slice(0, 20);
+    return { status: 200, json: { ok: true, items, families: idx.size ? (await allCards()).filter(x => x.vis === 'public' && x.fam).length : 0 } };
+  }
   async function following(req) {   // people I follow, newest first — for the story-ring row
     const v = await auth(req); if (!v) return NEED;
     return { status: 200, json: { ok: true, items: (await expandIds((v.fing || []).slice(-30).reverse())).filter(c => !c.hidden) } };
@@ -297,6 +332,6 @@ function makeAccounts({ store, adminKey }) {
       withFamily: all.filter(c => c.fam).length, recent: all.slice(0, 15).map(c => ({ un: c.un, name: c.name, vis: c.vis, m: c.m, fol: c.fol, hidden: c.hidden, at: c.at })) };
   }
 
-  return { check, signup, login, logout, me, update, password, removeAcct, family, backupPut, backupGet, view, follow, answer, people, search, suggest, following, explore, feed, report, adminHide, adminReset, adminStats };
+  return { check, signup, login, logout, me, update, password, removeAcct, family, backupPut, backupGet, view, follow, answer, people, search, suggest, following, explore, kin, feed, report, adminHide, adminReset, adminStats };
 }
 module.exports = { makeAccounts };
