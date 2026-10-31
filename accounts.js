@@ -293,7 +293,10 @@ function makeAccounts({ store, adminKey }) {
   }
   async function following(req) {   // people I follow, newest first — for the story-ring row
     const v = await auth(req); if (!v) return NEED;
-    return { status: 200, json: { ok: true, items: (await expandIds((v.fing || []).slice(-30).reverse())).filter(c => !c.hidden) } };
+    const fol = new Set(v.fol || []); const out = [];
+    for (const id of (v.fing || []).slice(-60).reverse()) { const c = await store.get('c2:' + id); if (c && !c.hidden) out.push(Object.assign({}, c, { mutual: fol.has(id) })); }   // mutual = we follow each other
+    out.sort((a, b) => (b.mutual ? 1 : 0) - (a.mutual ? 1 : 0));
+    return { status: 200, json: { ok: true, items: out } };
   }
   function postsOf(d) {
     const KIND = { p: 'post', m: 'memory', v: 'voice' };
