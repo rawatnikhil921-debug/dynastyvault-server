@@ -298,6 +298,7 @@ app.get('/api/people/list', wrap(req => acc.people(req)));
 app.get('/api/people/search', wrap(req => acc.search(req)));
 app.get('/api/people/suggest', wrap(req => acc.suggest(req)));
 app.get('/api/people/following', wrap(req => acc.following(req)));
+app.get('/api/people/allies', wrap(req => acc.allies(req)));
 app.get('/api/people/explore', wrap(req => acc.explore(req)));
 app.post('/api/people/kin', wrap(req => acc.kin(req, ipOf(req))));
 

@@ -152,6 +152,7 @@ function makeAccounts({ store, adminKey }) {
     if (!self && !seen.has(vk)) { seen.set(vk, 1); if (seen.size > 30000) seen.clear(); a.views = (a.views || 0) + 1; await store.set('u:' + a.id, a); }
     const out = { ok: true, p: Object.assign(cardOf(a), { ph: a.ph || a.thumb || '', bio: a.bio || '', following: (a.fing || []).length, followers: (a.fol || []).length, views: a.views || 0, famName: a.famName || '' }),
       self, isFollowing: following, requested, followsYou: !!v && (a.fing || []).includes(v.id), open };
+    out.p.allies = (a.fol || []).filter(x => (a.fing || []).includes(x)).length;
     if (open && a.famOn && a.hasFam) { const f = await store.get('f:' + a.id); if (f) out.d = f.d; }
     return { status: 200, json: out };
   }
@@ -160,8 +161,11 @@ function makeAccounts({ store, adminKey }) {
     const b = req.body || {}; const id = await store.get('n:' + normU(b.u)); const a = id && await getA(id);
     if (!a || a.hidden) return { status: 404, json: { error: 'Account not found.' } }; if (a.id === v.id) return { status: 400, json: { error: 'That is you.' } };
     a.fol = a.fol || []; a.req = a.req || []; v.fing = v.fing || [];
-    if (b.on === false) { a.fol = a.fol.filter(x => x !== v.id); a.req = a.req.filter(r => r.id !== v.id); v.fing = v.fing.filter(x => x !== a.id); }
-    else if (a.vis === 'public') { if (!a.fol.includes(v.id)) { a.fol.push(v.id); note(a, 'follow', v.id); } if (!v.fing.includes(a.id)) v.fing.push(a.id); }
+    if (b.on === false) {
+      a.fol = a.fol.filter(x => x !== v.id); a.req = a.req.filter(r => r.id !== v.id); v.fing = v.fing.filter(x => x !== a.id);
+      if (b.both) { v.fol = (v.fol || []).filter(x => x !== a.id); v.req = (v.req || []).filter(r => r.id !== a.id); a.fing = (a.fing || []).filter(x => x !== v.id); }   // "remove ally": both directions
+    }
+    else if (a.vis === 'public') { if (!a.fol.includes(v.id)) { a.fol.push(v.id); note(a, (a.fing || []).includes(v.id) ? 'ally' : 'follow', v.id); } if (!v.fing.includes(a.id)) v.fing.push(a.id); }
     else if (!a.fol.includes(v.id) && !a.req.some(r => r.id === v.id)) { a.req.unshift({ id: v.id, t: Date.now() }); a.req = a.req.slice(0, 500); note(a, 'request', v.id); }
     await putA(a); await putA(v);
     return { status: 200, json: { ok: true, isFollowing: a.fol.includes(v.id), requested: a.req.some(r => r.id === v.id), followers: a.fol.length } };
@@ -177,7 +181,7 @@ function makeAccounts({ store, adminKey }) {
     const q = req.query || {}; const id = await store.get('n:' + normU(q.u)); const a = id && await getA(id); if (!a || a.hidden) return { status: 404, json: { error: 'Not found.' } };
     const v = await auth(req); const open = (v && v.id === a.id) || a.vis === 'public' || (v && (a.fol || []).includes(v.id));
     if (!open) return { status: 403, json: { error: 'This account is private.', code: 'PRIVATE' } };
-    const ids = q.kind === 'following' ? (a.fing || []) : (a.fol || []);
+    const ids = q.kind === 'allies' ? (a.fol || []).filter(x => (a.fing || []).includes(x)) : q.kind === 'following' ? (a.fing || []) : (a.fol || []);
     return { status: 200, json: { ok: true, items: (await expandIds(ids.slice().reverse())).filter(c => !c.hidden) } };
   }
   // ---------- 🔍 search & "people you may know" ----------
@@ -291,6 +295,28 @@ function makeAccounts({ store, adminKey }) {
     const items = [...by.values()].sort((a, b) => b.people.length - a.people.length || b.people.filter(p => p.sure).length - a.people.filter(p => p.sure).length).slice(0, 20);
     return { status: 200, json: { ok: true, items, families: idx.size ? (await allCards()).filter(x => x.vis === 'public' && x.fam).length : 0 } };
   }
+  // 🤝 Allies (like Facebook friends): we follow each other. Requests = they added me, I haven't added back.
+  const alliesOf = a => (a.fol || []).filter(x => (a.fing || []).includes(x));
+  const dynScore = (a, n) => (a.m || 0) * 10 + (a.g || 0) * 40 + n * 15 + (a.hasFam ? 20 : 0);
+  async function allies(req) {
+    const v = await auth(req); if (!v) return NEED;
+    const fing = new Set(v.fing || []); const fol = new Set(v.fol || []);
+    const allyIds = (v.fing || []).filter(x => fol.has(x)); const mine = new Set(allyIds);
+    const pend = new Set((v.req || []).map(r => r.id));
+    const reqIds = [...new Set([...(v.req || []).map(r => r.id), ...(v.fol || []).slice().reverse().filter(x => !fing.has(x))])];
+    const sentIds = (v.fing || []).slice().reverse().filter(x => !fol.has(x));
+    const enrich = async (ids, n) => {
+      const out = [];
+      for (const id of ids.slice(0, n)) {
+        const o = await getA(id); if (!o || o.hidden || o.disabled) continue; const oa = alliesOf(o);
+        out.push(Object.assign(cardOf(o), { famName: o.famName || '', allies: oa.length, mutualAllies: oa.filter(x => mine.has(x)).length, score: dynScore(o, oa.length), pending: pend.has(id) }));
+      }
+      return out;
+    };
+    const list = await enrich(allyIds.slice().reverse(), 300);
+    return { status: 200, json: { ok: true, allies: list, requests: await enrich(reqIds, 60), sent: await enrich(sentIds, 60),
+      me: Object.assign(cardOf(v), { famName: v.famName || '', allies: allyIds.length, score: dynScore(v, allyIds.length) }) } };
+  }
   async function following(req) {   // people I follow, newest first — for the story-ring row
     const v = await auth(req); if (!v) return NEED;
     const fol = new Set(v.fol || []); const out = [];
@@ -335,6 +361,6 @@ function makeAccounts({ store, adminKey }) {
       withFamily: all.filter(c => c.fam).length, recent: all.slice(0, 15).map(c => ({ un: c.un, name: c.name, vis: c.vis, m: c.m, fol: c.fol, hidden: c.hidden, at: c.at })) };
   }
 
-  return { check, signup, login, logout, me, update, password, removeAcct, family, backupPut, backupGet, view, follow, answer, people, search, suggest, following, explore, kin, feed, report, adminHide, adminReset, adminStats };
+  return { check, signup, login, logout, me, update, password, removeAcct, family, backupPut, backupGet, view, follow, answer, people, search, suggest, following, allies, explore, kin, feed, report, adminHide, adminReset, adminStats };
 }
 module.exports = { makeAccounts };
