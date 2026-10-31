@@ -296,6 +296,8 @@ app.post('/api/people/follow', wrap(async req => { const r = await acc.follow(re
 app.post('/api/people/answer', wrap(req => acc.answer(req)));
 app.get('/api/people/list', wrap(req => acc.people(req)));
 app.get('/api/people/search', wrap(req => acc.search(req)));
+app.get('/api/people/suggest', wrap(req => acc.suggest(req)));
+app.get('/api/people/following', wrap(req => acc.following(req)));
 app.get('/api/people/feed', wrap(req => acc.feed(req)));
 app.post('/api/people/report', wrap(req => acc.report(req, ipOf(req))));
 app.post('/api/admin/acct/hide', wrap(req => acc.adminHide(req.body || {})));

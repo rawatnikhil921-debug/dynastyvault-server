@@ -62,7 +62,7 @@ function makeAccounts({ store, adminKey }) {
   // ---------- sign up / log in ----------
   async function check(q) { const u = normU(q.u); if (!okUser(u)) return { status: 200, json: { ok: true, free: false, why: 'format' } }; return { status: 200, json: { ok: true, free: !(await store.get('n:' + u)) } }; }
   async function signup(b, ip) {
-    if (limited('su' + ip, 8, 3600000)) return tooMany;
+    if (limited('su' + ip, 40, 3600000)) return tooMany;   // generous: Indian mobile networks put many phones behind one IP
     const un = normU(b.username); const name = S(b.name, 60).trim(); const pw = String(b.password || ''); const em = normE(b.email);
     if (!okUser(un)) return { status: 400, json: { error: 'Username: 3–24 small letters or numbers (dots and underscores allowed).', code: 'BAD_USER' } };
     if (name.length < 2) return { status: 400, json: { error: 'Please write your name.', code: 'BAD_NAME' } };
@@ -78,7 +78,7 @@ function makeAccounts({ store, adminKey }) {
   }
   async function login(b, ip) {
     const who = S(b.username, 120).trim().toLowerCase().replace(/^@+/, '');
-    if (limited('li' + ip, 20, 900000) || limited('lu' + who, 10, 900000)) return tooMany;
+    if (limited('li' + ip, 80, 900000) || limited('lu' + who, 10, 900000)) return tooMany;
     const id = who.includes('@') ? await store.get('e:' + who) : await store.get('n:' + who);
     const a = id && await getA(id);
     const bad = { status: 401, json: { error: 'Wrong username or password.', code: 'BAD_LOGIN' } };
@@ -180,13 +180,69 @@ function makeAccounts({ store, adminKey }) {
     const ids = q.kind === 'following' ? (a.fing || []) : (a.fol || []);
     return { status: 200, json: { ok: true, items: (await expandIds(ids.slice().reverse())).filter(c => !c.hidden) } };
   }
+  // ---------- 🔍 search & "people you may know" ----------
+  const lastWord = n => String(n || '').trim().toLowerCase().split(/\s+/).filter(Boolean).slice(-1)[0] || '';
+  const fold = t => String(t || '').toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+  async function mutualMap(v, limit = 40) {   // candidate id -> ids of people I follow who follow them
+    const m = new Map(); if (!v) return m;
+    for (const fid of (v.fing || []).slice(-limit)) { const f = await getA(fid); if (!f || f.hidden) continue; for (const x of f.fing || []) { if (x === v.id) continue; if (!m.has(x)) m.set(x, []); m.get(x).push(fid); } }
+    return m;
+  }
+  async function nameOf(ids, n = 2) { const out = []; for (const id of ids.slice(0, n)) { const c = await store.get('c2:' + id); if (c) out.push(c.name.split(' ')[0]); } return out; }
   async function search(req) {
-    const q = req.query || {}; const term = S(q.q, 60).trim().toLowerCase().replace(/^@/, ''); const v = await auth(req);
+    const q = req.query || {}; const term = fold(S(q.q, 60).trim()).replace(/^@/, ''); const v = await auth(req); const filt = S(q.f, 12);
     let c = await allCards(); if (v) c = c.filter(x => x.id !== v.id);
-    if (term) c = c.filter(x => (x.un + ' ' + x.name + ' ' + x.city + ' ' + x.bio).toLowerCase().includes(term));
-    c = c.slice().sort((x, y) => (y.vis === 'public') - (x.vis === 'public') || (y.fol + y.m / 5 + (y.ph ? 2 : 0)) - (x.fol + x.m / 5 + (x.ph ? 2 : 0)) || y.at - x.at);
-    const fing = new Set(v ? v.fing || [] : []);
-    return { status: 200, json: { ok: true, total: c.length, items: c.slice(0, Math.min(60, N(q.limit) || 40)).map(x => Object.assign({}, x, { isFollowing: fing.has(x.id) })) } };
+    const sur = new Set(String(q.sn || '').toLowerCase().split(',').map(x => x.trim()).filter(x => x.length > 1).slice(0, 12));
+    const city = fold(S(q.city || (v && v.city) || '', 60).trim());
+    if (filt === 'surname') c = c.filter(x => sur.has(lastWord(x.name)));
+    if (filt === 'city') c = c.filter(x => city && fold(x.city).includes(city));
+    const scored = [];
+    for (const x of c) {
+      let sc = 0; const un = x.un, nm = fold(x.name), words = nm.split(/\s+/);
+      if (term) {
+        if (un === term) sc += 120; else if (un.startsWith(term)) sc += 70; else if (un.includes(term)) sc += 30;
+        if (nm === term) sc += 110; else if (nm.startsWith(term)) sc += 65; else if (words.some(w => w.startsWith(term))) sc += 55; else if (nm.includes(term)) sc += 25;
+        if (fold(x.city).includes(term)) sc += 20; if (fold(x.bio).includes(term)) sc += 6;
+        if (!sc) continue;
+      }
+      if (sur.has(lastWord(x.name))) sc += 12; if (city && fold(x.city).includes(city)) sc += 8;
+      sc += Math.min(20, (x.fol || 0) / 2) + (x.ph ? 3 : 0) + (x.vis === 'public' ? 2 : 0);
+      scored.push([sc, x]);
+    }
+    scored.sort((a, b) => b[0] - a[0] || b[1].at - a[1].at);
+    const fing = new Set(v ? v.fing || [] : []); const fol = new Set(v ? v.fol || [] : []); const pend = new Set();
+    const mm = v && scored.length ? await mutualMap(v, 25) : new Map();
+    const items = [];
+    for (const [, x] of scored.slice(0, Math.min(60, N(q.limit) || 40))) {
+      const mu = mm.get(x.id) || [];
+      items.push(Object.assign({}, x, { isFollowing: fing.has(x.id), followsYou: fol.has(x.id), mutual: mu.length, mutualNames: mu.length ? await nameOf(mu) : [], sameSurname: sur.has(lastWord(x.name)) }));
+    }
+    return { status: 200, json: { ok: true, total: scored.length, items } };
+  }
+  async function suggest(req) {
+    const q = req.query || {}; const v = await auth(req);
+    const sur = new Set(String(q.sn || '').toLowerCase().split(',').map(x => x.trim()).filter(x => x.length > 1).slice(0, 12));
+    const city = fold(S(q.city || (v && v.city) || '', 60).trim());
+    const fing = new Set(v ? v.fing || [] : []); const fol = new Set(v ? v.fol || [] : []); const pend = new Set();
+    let c = (await allCards()).filter(x => (!v || x.id !== v.id) && !fing.has(x.id));
+    const mm = await mutualMap(v, 40); const out = [];
+    for (const x of c) {
+      const mu = mm.get(x.id) || []; let sc = 0, why = 'popular';
+      if (fol.has(x.id)) { sc += 80; why = 'followsYou'; }
+      if (mu.length) { sc += 30 + mu.length * 12; if (why === 'popular') why = 'mutual'; }
+      if (sur.has(lastWord(x.name))) { sc += 35; if (why === 'popular') why = 'surname'; }
+      if (city && fold(x.city).includes(city)) { sc += 18; if (why === 'popular') why = 'city'; }
+      sc += Math.min(15, (x.fol || 0) / 2) + (x.ph ? 4 : 0) + (x.fam ? 3 : 0);
+      out.push([sc, x, why, mu]);
+    }
+    out.sort((a, b) => b[0] - a[0] || b[1].at - a[1].at);
+    const items = [];
+    for (const [, x, why, mu] of out.slice(0, Math.min(30, N(q.limit) || 15))) items.push(Object.assign({}, x, { why, mutual: mu.length, mutualNames: mu.length ? await nameOf(mu) : [], followsYou: fol.has(x.id), isFollowing: false }));
+    return { status: 200, json: { ok: true, items } };
+  }
+  async function following(req) {   // people I follow, newest first — for the story-ring row
+    const v = await auth(req); if (!v) return NEED;
+    return { status: 200, json: { ok: true, items: (await expandIds((v.fing || []).slice(-30).reverse())).filter(c => !c.hidden) } };
   }
   function postsOf(d) {
     const KIND = { p: 'post', m: 'memory', v: 'voice' };
@@ -224,6 +280,6 @@ function makeAccounts({ store, adminKey }) {
       withFamily: all.filter(c => c.fam).length, recent: all.slice(0, 15).map(c => ({ un: c.un, name: c.name, vis: c.vis, m: c.m, fol: c.fol, hidden: c.hidden, at: c.at })) };
   }
 
-  return { check, signup, login, logout, me, update, password, removeAcct, family, backupPut, backupGet, view, follow, answer, people, search, feed, report, adminHide, adminReset, adminStats };
+  return { check, signup, login, logout, me, update, password, removeAcct, family, backupPut, backupGet, view, follow, answer, people, search, suggest, following, feed, report, adminHide, adminReset, adminStats };
 }
 module.exports = { makeAccounts };
