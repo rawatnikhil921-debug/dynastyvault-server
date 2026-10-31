@@ -246,7 +246,8 @@ function makeAccounts({ store, adminKey }) {
   }
   function postsOf(d) {
     const KIND = { p: 'post', m: 'memory', v: 'voice' };
-    return (Array.isArray(d && d.p) ? d.p : []).slice(0, 15).map(r => ({ k: KIND[r[0]] || 'post', by: S(r[1], 60), text: S(r[2], 400), at: +r[3] || 0, about: S(r[4], 80) })).filter(p => p.text);
+    const pp = Array.isArray(d && d.pp) ? d.pp : [];
+    return (Array.isArray(d && d.p) ? d.p : []).slice(0, 15).map((r, i) => ({ k: KIND[r[0]] || 'post', by: S(r[1], 60), text: S(r[2], 400), at: +r[3] || 0, about: S(r[4], 80), ph: typeof pp[i] === 'string' && IMG.test(pp[i]) && pp[i].length < 90000 ? pp[i] : '' })).filter(p => p.text || p.ph);
   }
   async function feed(req) {
     const v = await auth(req); if (!v) return NEED; const out = [];
