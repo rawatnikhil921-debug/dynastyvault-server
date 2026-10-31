@@ -300,6 +300,31 @@ app.get('/api/people/suggest', wrap(req => acc.suggest(req)));
 app.get('/api/people/following', wrap(req => acc.following(req)));
 app.get('/api/people/explore', wrap(req => acc.explore(req)));
 app.post('/api/people/kin', wrap(req => acc.kin(req, ipOf(req))));
+
+/* ---------- 🎮 Daily "This or That" poll — only two counters per day, no personal data ---------- */
+const PLAY_DAY0 = Date.UTC(2026, 9, 1);
+const playDay = () => Math.floor((Date.now() + 5.5 * 3600000 - PLAY_DAY0) / 86400000);   // India day, same as the app
+const POLL = { d:-1, a:0, b:0, seen:new Map(), ips:new Map(), dirty:false };
+async function pollLoad(d) {
+  if (POLL.d === d) return;
+  if (POLL.dirty && POLL.d >= 0) { try { await store.set('poll:' + POLL.d, { a:POLL.a, b:POLL.b }); } catch (e) { /* keep going */ } }
+  let v = null; try { v = await store.get('poll:' + d); } catch (e) { v = null; }
+  Object.assign(POLL, { d, a:(v && +v.a) || 0, b:(v && +v.b) || 0, seen:new Map(), ips:new Map(), dirty:false });
+}
+setInterval(() => { if (POLL.dirty && POLL.d >= 0) { POLL.dirty = false; store.set('poll:' + POLL.d, { a:POLL.a, b:POLL.b }).catch(e => { POLL.dirty = true; console.error('[poll]', e.message); }); } }, 5000).unref();
+app.get('/api/play/poll', wrap(async () => { const d = playDay(); await pollLoad(d); return { status:200, json:{ ok:true, d, a:POLL.a, b:POLL.b } }; }));
+app.post('/api/play/vote', wrap(async req => {
+  const b = req.body || {}; const d = playDay();
+  if (+b.d !== d) return { status:409, json:{ error:'A new question is up — refresh.', code:'DAY' } };
+  await pollLoad(d);
+  const c = +b.c === 1 ? 1 : 0; const id = String(b.id || '').replace(/[^a-z0-9]/gi, '').slice(0, 40); const ip = ipOf(req);
+  const n = POLL.ips.get(ip) || 0;
+  if (id.length >= 8 && !POLL.seen.has(id) && n < 30) {
+    POLL.seen.set(id, c); POLL.ips.set(ip, n + 1); if (c) POLL.b++; else POLL.a++; POLL.dirty = true;
+    if (POLL.seen.size > 200000) POLL.seen.clear();
+  }
+  return { status:200, json:{ ok:true, d, a:POLL.a, b:POLL.b } };
+}));
 app.get('/api/people/feed', wrap(req => acc.feed(req)));
 app.post('/api/people/report', wrap(req => acc.report(req, ipOf(req))));
 app.post('/api/admin/acct/hide', wrap(req => acc.adminHide(req.body || {})));
