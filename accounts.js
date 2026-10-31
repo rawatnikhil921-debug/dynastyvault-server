@@ -34,7 +34,7 @@ function makeAccounts({ store, adminKey }) {
 
   // ---------- records ----------
   const getA = id => id ? store.get('u:' + id) : null;
-  const cardOf = a => ({ id: a.id, un: a.un, name: a.name, ph: a.thumb || '', city: a.city || '', bio: S(a.bio, 80), vis: a.vis, m: a.m || 0, g: a.g || 0, fam: !!a.famOn && !!a.hasFam, fol: (a.fol || []).length, at: a.up || a.at, hidden: !!a.hidden });
+  const cardOf = a => ({ id: a.id, un: a.un, name: a.name, ph: a.thumb || '', city: a.city || '', bio: S(a.bio, 80), vis: a.vis, m: a.m || 0, g: a.g || 0, fam: !!a.famOn && !!a.hasFam, famName: S(a.famName || '', 60), fol: (a.fol || []).length, at: a.up || a.at, hidden: !!a.hidden });
   async function putA(a) { a.up = Date.now(); await store.set('u:' + a.id, a); await store.set('c2:' + a.id, cardOf(a)); cards = null; }
   let cards = null, cardsAt = 0;
   async function allCards() { if (cards && Date.now() - cardsAt < 45000) return cards; cards = (await store.list('c2:', 2000)).map(r => r.v).filter(c => c && !c.hidden); cardsAt = Date.now(); return cards; }
@@ -192,6 +192,7 @@ function makeAccounts({ store, adminKey }) {
     for (const fid of (v.fing || []).slice(-limit)) { const f = await getA(fid); if (!f || f.hidden) continue; for (const x of f.fing || []) { if (x === v.id) continue; if (!m.has(x)) m.set(x, []); m.get(x).push(fid); } }
     return m;
   }
+  async function phOf(ids, n = 2) { const out = []; for (const id of ids.slice(0, n)) { const c = await store.get('c2:' + id); if (c && c.ph) out.push(c.ph); } return out; }   // tiny mutual-ally photos, like Facebook
   async function nameOf(ids, n = 2) { const out = []; for (const id of ids.slice(0, n)) { const c = await store.get('c2:' + id); if (c) out.push(c.name.split(' ')[0]); } return out; }
   async function search(req) {
     const q = req.query || {}; const term = fold(S(q.q, 60).trim()).replace(/^@/, ''); const v = await auth(req); const filt = S(q.f, 12);
@@ -200,6 +201,7 @@ function makeAccounts({ store, adminKey }) {
     const city = fold(S(q.city || (v && v.city) || '', 60).trim());
     if (filt === 'surname') c = c.filter(x => sur.has(lastWord(x.name)));
     if (filt === 'city') c = c.filter(x => city && fold(x.city).includes(city));
+    if (filt === 'fam') c = c.filter(x => x.fam);
     const scored = [];
     for (const x of c) {
       let sc = 0; const un = x.un, nm = fold(x.name), words = nm.split(/\s+/);
@@ -219,7 +221,7 @@ function makeAccounts({ store, adminKey }) {
     const items = [];
     for (const [, x] of scored.slice(0, Math.min(60, N(q.limit) || 40))) {
       const mu = mm.get(x.id) || [];
-      items.push(Object.assign({}, x, { isFollowing: fing.has(x.id), followsYou: fol.has(x.id), mutual: mu.length, mutualNames: mu.length ? await nameOf(mu) : [], sameSurname: sur.has(lastWord(x.name)) }));
+      items.push(Object.assign({}, x, { isFollowing: fing.has(x.id), followsYou: fol.has(x.id), mutual: mu.length, mutualNames: mu.length ? await nameOf(mu) : [], mutualPh: mu.length ? await phOf(mu) : [], sameSurname: sur.has(lastWord(x.name)) }));
     }
     return { status: 200, json: { ok: true, total: scored.length, items } };
   }
@@ -241,7 +243,7 @@ function makeAccounts({ store, adminKey }) {
     }
     out.sort((a, b) => b[0] - a[0] || b[1].at - a[1].at);
     const items = [];
-    for (const [, x, why, mu] of out.slice(0, Math.min(30, N(q.limit) || 15))) items.push(Object.assign({}, x, { why, mutual: mu.length, mutualNames: mu.length ? await nameOf(mu) : [], followsYou: fol.has(x.id), isFollowing: false }));
+    for (const [, x, why, mu] of out.slice(0, Math.min(30, N(q.limit) || 15))) items.push(Object.assign({}, x, { why, mutual: mu.length, mutualNames: mu.length ? await nameOf(mu) : [], mutualPh: mu.length ? await phOf(mu) : [], followsYou: fol.has(x.id), isFollowing: false }));
     return { status: 200, json: { ok: true, items } };
   }
   // Explore: recent posts from public families, newest first, a few per family so one family can't fill the page
@@ -303,13 +305,14 @@ function makeAccounts({ store, adminKey }) {
     const fing = new Set(v.fing || []); const fol = new Set(v.fol || []);
     const allyIds = (v.fing || []).filter(x => fol.has(x)); const mine = new Set(allyIds);
     const pend = new Set((v.req || []).map(r => r.id));
+    const when = new Map(); (v.notes || []).forEach(n => { if (!when.has(n.id) && /follow|ally|request/.test(n.type)) when.set(n.id, n.t); }); (v.req || []).forEach(r => { if (r.t) when.set(r.id, r.t); });
     const reqIds = [...new Set([...(v.req || []).map(r => r.id), ...(v.fol || []).slice().reverse().filter(x => !fing.has(x))])];
     const sentIds = (v.fing || []).slice().reverse().filter(x => !fol.has(x));
     const enrich = async (ids, n) => {
       const out = [];
       for (const id of ids.slice(0, n)) {
-        const o = await getA(id); if (!o || o.hidden || o.disabled) continue; const oa = alliesOf(o);
-        out.push(Object.assign(cardOf(o), { famName: o.famName || '', allies: oa.length, mutualAllies: oa.filter(x => mine.has(x)).length, score: dynScore(o, oa.length), pending: pend.has(id) }));
+        const o = await getA(id); if (!o || o.hidden || o.disabled) continue; const oa = alliesOf(o); const mu = oa.filter(x => mine.has(x));
+        out.push(Object.assign(cardOf(o), { famName: o.famName || '', allies: oa.length, mutualAllies: mu.length, mutualPh: mu.length ? await phOf(mu) : [], t: when.get(id) || 0, score: dynScore(o, oa.length), pending: pend.has(id) }));
       }
       return out;
     };
